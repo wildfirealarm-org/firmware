@@ -116,7 +116,7 @@ package servers. Every machine that builds the firmware needs it once:
 needs the same files. Put the unzipped SDK in a private GitHub repository
 that only the team can read, then add two repository secrets to
 biobot-firmware: `BMV080_SDK_REPO` (for example
-`biobotproject-org/bmv080-sdk`) and `BMV080_SDK_TOKEN` (a fine-grained
+`wildfirealarm-org/bmv080-sdk`) and `BMV080_SDK_TOKEN` (a fine-grained
 personal access token with read access to that private repository).
 Until both exist the job skips with a notice rather than failing.
 
