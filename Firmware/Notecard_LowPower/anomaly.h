@@ -1,4 +1,4 @@
-// anomaly.h - On-device anomaly detection for the BioBot sensor node.
+// anomaly.h - On-device anomaly detection for the Wildfire Alarm sensor node.
 //
 // This module is deliberately free of Arduino dependencies so it can be
 // compiled and unit-tested on a desktop machine (see test/test_anomaly.cpp).

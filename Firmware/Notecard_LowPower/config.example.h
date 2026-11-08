@@ -13,7 +13,7 @@
 
 // This node.
 #define DEVICE_ID "biobot-001"
-#define DEVICE_NAME "BioBot Node 1"
+#define DEVICE_NAME "Wildfire Alarm Node 1"
 #define DEVICE_TYPE "air-quality-monitor"
 
 // ---------------------------------------------------------------------------

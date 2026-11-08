@@ -1,4 +1,7 @@
-// BioBot sensor node firmware - LOW POWER VARIANT (under test, not merged)
+// Wildfire Alarm sensor node firmware - LOW POWER VARIANT
+//
+// The recommended firmware for any node on battery or solar. Firmware/Notecard
+// is the same node without sleep, for bench or mains use.
 //
 // Differs from Firmware/Notecard in four ways:
 //   - samples once a minute instead of every 30 s, and sends a batch every
@@ -17,7 +20,7 @@
 // Blues Notecard cellular modem to Notehub.
 //
 // Three kinds of notes leave the node:
-//   device.qo  once at boot: registers the node with the BioBot API
+//   device.qo  once at boot: registers the node with the Wildfire Alarm API
 //   data.qo    every DATA_SEND_INTERVAL_MS: a batch of readings
 //   alert.qo   immediately when the anomaly detector raises, escalates,
 //              repeats or clears an event (synced right away)
@@ -1031,7 +1034,7 @@ void setup() {
   delay(2000);
 
   Serial.println("\n========================================");
-  Serial.println("  BioBot sensor node");
+  Serial.println("  Wildfire Alarm sensor node");
   Serial.println("========================================");
   Serial.printf("Device:        %s (%s)\n", DEVICE_ID, DEVICE_NAME);
   Serial.printf("Read interval: %lu s\n", (unsigned long)(SENSOR_READ_INTERVAL_MS / 1000));

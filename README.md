@@ -1,8 +1,19 @@
-# BioBot firmware
+# Wildfire Alarm firmware
 
-Firmware for the BioBot wildfire-watch sensor node: an open, low-cost module
+Firmware for the Wildfire Alarm sensor node: an open, low-cost module
 that towns and volunteers place at the forest edge to catch early signs of
 smoke and fire. See the mission document for the bigger picture.
+
+## Which firmware to use
+
+| Folder | Use it for | Samples | Sends a batch |
+| --- | --- | --- | --- |
+| `Firmware/Notecard_LowPower` | **Any node on battery or solar.** Light-sleeps between samples, and can read battery state from a Victron charge controller over Bluetooth | every 60 s | every 20 min |
+| `Firmware/Notecard` | Bench or mains power, where current draw does not matter | every 30 s | every 10 min |
+
+Both run the same sensors, anomaly detector and notes, described below with
+the `Firmware/Notecard` timings. The low-power variant's own differences are in
+[`Firmware/Notecard_LowPower/README.md`](Firmware/Notecard_LowPower/README.md).
 
 ## What the node does
 
@@ -15,7 +26,7 @@ Every 30 seconds the node reads:
 
 Each sample goes through the on-device anomaly detector, then into a buffer.
 A Blues Notecard cellular modem carries three kinds of notes to Notehub, which
-routes them to the BioBot API:
+routes them to the Wildfire Alarm API:
 
 | Note file | When | Contents |
 | --- | --- | --- |
@@ -85,11 +96,16 @@ periodic reminder), or `cleared`.
    its SparkFun Toolkit dependency), and **Blues Wireless Notecard**.
 3. Install the Bosch BMV080 SDK into the SparkFun library. See the next
    section; the build fails with `bmv080.h not found` until this is done.
-4. Copy `Firmware/Notecard/config.example.h` to `Firmware/Notecard/config.h`
-   and fill in your Notehub product UID and device identity. `config.h` is
-   git-ignored.
-5. Open `Firmware/Notecard/Notecard.ino` and upload. Serial Monitor at
-   115200 baud shows every step of startup.
+4. Pick the firmware folder (see "Which firmware to use"). Copy its
+   `config.example.h` to `config.h` in the same folder and fill in your
+   Notehub product UID and device identity. `config.h` is git-ignored.
+5. Open the folder's `.ino` (`Notecard_LowPower.ino` or `Notecard.ino`) and
+   upload. Serial Monitor at 115200 baud shows every step of startup.
+
+The firmware sends `hub.set` with the product UID and mode at every boot, so
+a new or swapped Notecard needs no separate setup. To check a Notecard on its
+own first, `Firmware/diagnostics/notecard_console` passes requests typed in
+the Serial Monitor straight to it.
 
 Wiring defaults are at the top of the sketch: I2C on A4/A5 at 100 kHz.
 
@@ -116,7 +132,7 @@ package servers. Every machine that builds the firmware needs it once:
 needs the same files. Put the unzipped SDK in a private GitHub repository
 that only the team can read, then add two repository secrets to
 biobot-firmware: `BMV080_SDK_REPO` (for example
-`biobotproject-org/bmv080-sdk`) and `BMV080_SDK_TOKEN` (a fine-grained
+`wildfirealarm-org/bmv080-sdk`) and `BMV080_SDK_TOKEN` (a fine-grained
 personal access token with read access to that private repository).
 Until both exist the job skips with a notice rather than failing.
 
@@ -233,7 +249,8 @@ Two of the three large loads are settings:
   go out immediately; the modem just drops the tower connection in between.
 
 Together they take the node to roughly 11 Wh/day. Putting the ESP32 to
-sleep between samples is the remaining lever and is not done yet.
+sleep between samples is the remaining lever; `Firmware/Notecard_LowPower`
+does that, and also samples and sends half as often.
 
 ## Testing the detector on your computer
 
@@ -254,16 +271,18 @@ gas heater.
 ## Repository layout
 
 ```
-Firmware/Notecard/Notecard.ino      main sketch: sensors, buffering, Notecard I/O
-Firmware/Notecard/anomaly.h / .cpp  portable anomaly detector
-Firmware/Notecard/config.example.h  template for per-node secrets and identity
+Firmware/Notecard_LowPower/         low-power sketch for battery and solar nodes, plus Victron BLE readout
+Firmware/Notecard/Notecard.ino      sketch without sleep, for bench and mains
+Firmware/Notecard/anomaly.h / .cpp  portable anomaly detector (copied into Notecard_LowPower)
+Firmware/Notecard/config.example.h  template for per-node identity
 Firmware/Notecard/test/             host-side unit tests
+Firmware/diagnostics/               bench sketches: Notecard console, I2C watch, BME check
 archive/new.grc/                    earlier UART-based prototype, kept for reference
 ```
 
 ## Power note
 
-The default Notehub mode is `continuous`, which keeps the modem online and is
-the hungriest setting. For a solar node, set `NOTEHUB_MODE` to `"periodic"`
-in `config.h`. Alert notes are added with `sync:true`, so they still go out
-immediately in periodic mode; only routine batches wait for the next sync.
+Both `config.example.h` files default to `NOTEHUB_MODE "periodic"`, which
+lets the modem sleep between syncs. Every note is added with `sync:true`, so
+batches and alerts still go out immediately. Use `"continuous"` only on
+mains power.

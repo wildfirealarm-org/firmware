@@ -3,7 +3,7 @@
 // Copy this file to config.h in the same folder and fill in your values.
 // config.h is git-ignored so per-node settings never land in the repo.
 // The node carries no API credentials: the Notehub route that forwards
-// notes to the BioBot API adds the server's token itself.
+// notes to the Wildfire Alarm API adds the server's token itself.
 #pragma once
 
 // Blues Notehub product UID for this fleet (Notehub -> Project -> Settings).
@@ -19,5 +19,5 @@
 
 // This node.
 #define DEVICE_ID "biobot-001"
-#define DEVICE_NAME "BioBot Node 1"
+#define DEVICE_NAME "Wildfire Alarm Node 1"
 #define DEVICE_TYPE "air-quality-monitor"

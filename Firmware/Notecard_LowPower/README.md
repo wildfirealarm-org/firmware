@@ -1,9 +1,13 @@
 # Notecard_LowPower
 
-A copy of `Firmware/Notecard` with the power work applied, kept as a separate
-sketch so the proven firmware stays untouched. Bench-verified on 2026-10-17:
-sampling, batching and the Victron BLE battery readout all run; light sleep
-(`SLEEP_MODE 2`) has not yet been confirmed on hardware.
+The firmware for nodes on battery or solar: `Firmware/Notecard` with the
+power work applied. Bench-verified on 2026-10-17 (sampling, batching and the
+Victron BLE battery readout) and running on node 3. Light sleep has not yet
+been measured on hardware; `SLEEP_MODE 2` is the way to confirm it.
+
+On a battery-only node with no charge controller, set `VICTRON_BLE_ENABLED 0`
+in `config.h` so the node does not spend a Bluetooth scan every 10 minutes
+looking for one.
 
 ## What changed
 
