@@ -4,6 +4,30 @@ Throwaway sketches for isolating a fault on the bench. Upload one in place of
 the node firmware, read the output, then put the node firmware back. None of
 them is part of the node's normal operation.
 
+## notecard_console
+
+For setting up a new Notecard and checking it reaches Notehub before the
+node firmware goes on. The carrier board does not bring out the Notecard's
+own USB port, so Blues' web terminal cannot reach it; this sketch stands in.
+Each line typed in the Serial Monitor (115200 baud, line ending "Newline")
+is sent to the Notecard as a request and the reply is printed.
+
+```
+{"req":"card.version"}
+{"req":"hub.set","product":"com.example.you:biobot","mode":"periodic"}
+{"req":"hub.get"}
+{"req":"hub.sync"}
+{"req":"hub.sync.status"}
+{"req":"card.wireless"}
+```
+
+`hub.set` is stored on the Notecard, and the node firmware sends the same
+request at every boot, so a Notecard set up here or swapped in later ends up
+configured either way. Keep the battery connected: USB alone does not power
+the modem.
+
+Needs `Wire` and the Blues Wireless Notecard library.
+
 ## i2c_watch
 
 For an intermittent connector. A one-shot scan answers "is it there right now",
