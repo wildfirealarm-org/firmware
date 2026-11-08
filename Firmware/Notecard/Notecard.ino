@@ -40,6 +40,7 @@ static const uint32_t I2C_CLOCK_HZ = 100000;          // slow and robust for lon
 static const uint8_t BME_ADDR_PRIMARY = 0x77;
 static const uint8_t BME_ADDR_SECONDARY = 0x76;
 static const uint8_t BMV080_ADDR = 0x57;
+static const uint8_t NOTECARD_ADDR = 0x17;
 
 static const uint32_t SENSOR_READ_INTERVAL_MS = 30UL * 1000UL;        // 30 s
 static const uint32_t DATA_SEND_INTERVAL_MS = 10UL * 60UL * 1000UL;   // 10 min
@@ -51,6 +52,42 @@ static const uint32_t STATUS_PRINT_INTERVAL_MS = 60UL * 1000UL;
 // can be retried without losing samples.
 static const uint8_t BATCH_SIZE = DATA_SEND_INTERVAL_MS / SENSOR_READ_INTERVAL_MS;  // 20
 static const uint8_t BUFFER_CAPACITY = BATCH_SIZE + BATCH_SIZE / 2;                // 30
+
+// A BME680/688 that fails at boot or stops answering mid-run is retried
+// rather than written off: a brown-out during a cellular transmit, or a
+// connector nudged on the bench, should not cost the node every later sample.
+// Recovery is cheap, so it runs on the first failed read; the interval only
+// stops it looping tightly.
+static const uint32_t BME_RETRY_INTERVAL_MS = 10UL * 1000UL;
+
+// The gas heater is the only part of a reading that draws real current, so it
+// is what fails first on a sensor whose supply cannot hold up - and it is the
+// only channel the node can afford to give up. Temperature, humidity, pressure
+// and PM2.5 all keep working without it.
+static const uint16_t BME_HEATER_C = 320;
+static const uint16_t BME_HEATER_MS = 150;
+static const uint8_t BME_HEATER_OFF_AFTER_FAILURES = 3;
+static const uint32_t BME_HEATER_RETRY_INTERVAL_MS = 60UL * 60UL * 1000UL;
+
+// Continuous mode cost 182 mW to produce a sample every second, 29 of every
+// 30 of which were thrown away - a third of the node's whole power budget.
+// Duty cycling wakes the sensor once per period instead. 20 s is shorter than
+// the 30 s sample interval, so every sample window holds a fresh result no
+// matter how the two clocks drift. Results are cached as they arrive and a
+// sample reads the cache, so nothing ever waits on the sensor.
+static const uint16_t BMV080_DUTY_PERIOD_S = 20;
+static const uint32_t PM_SERVICE_INTERVAL_MS = 250;                        // cache refresh
+static const uint32_t PM_STALE_MS = 3UL * BMV080_DUTY_PERIOD_S * 1000UL;   // older is a fault
+
+// Its driver is retried the same way the BME's is: a sensor that would not open
+// at boot is not necessarily broken.
+static const uint8_t BMV080_BOOT_ATTEMPTS = 3;
+static const uint32_t BMV080_RETRY_INTERVAL_MS = 60UL * 1000UL;
+
+// Wall-clock time comes from the Notecard over the shared I2C bus, so it is
+// anchored once and carried forward on millis() instead of being re-fetched
+// for every sample.
+static const uint32_t TIME_REFRESH_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
 static const uint8_t SETUP_WARMUP_READS = 5;   // gas heater warmup in setup()
 static const uint8_t LOOP_WARMUP_READS = 2;    // early loop samples not buffered
@@ -65,6 +102,8 @@ struct Reading {
   float gasKOhm;
   float altitudeM;
   float pm1, pm25, pm10;
+  bool envValid;   // temperature, humidity, pressure, altitude usable
+  bool gasValid;   // gas resistance usable
   bool pmValid;
   bool pmObstructed;
   char timestampIso[24];  // "YYYY-MM-DDTHH:MM:SSZ"
@@ -81,6 +120,29 @@ static Reading buffer[BUFFER_CAPACITY];
 static uint8_t bufferCount = 0;
 
 static bool bmeReady = false;
+static uint8_t bmeAddr = 0;         // address it answered on, 0 if never found
+static uint8_t bmeFailures = 0;     // consecutive failed reads
+static uint32_t lastBmeRetryMs = 0;
+static bool bmeHeaterOn = true;
+static bool bmv080Ready = false;
+static uint32_t lastBmv080RetryMs = 0;
+
+// The particulate sensor's most recent result, filled in by taskPm().
+struct PmSample {
+  float pm1, pm25, pm10;
+  bool obstructed;
+  uint32_t atMs;
+  bool valid;
+};
+static PmSample pmCache = {0, 0, 0, false, 0, false};
+static uint32_t lastPmServiceMs = 0;
+static uint32_t bmeRetries = 0;     // reads that needed a second attempt
+static bool pmFaultLogged = false;  // the per-sample PM complaint is printed once
+static uint32_t lastHeaterRetryMs = 0;
+
+static bool timeValid = false;       // the Notecard has given us the time once
+static time_t timeBaseUnix = 0;      // its answer
+static uint32_t timeBaseMs = 0;      // millis() when that answer arrived
 static bool deviceRegistered = false;
 static uint32_t sampleCount = 0;
 static uint32_t droppedReadings = 0;
@@ -98,9 +160,10 @@ static float pressureToAltitudeM(float hPa, float seaLevelHpa = 1013.25f) {
   return 44330.0f * (1.0f - powf(hPa / seaLevelHpa, 0.1903f));
 }
 
-// Ask the Notecard for wall-clock time as ISO 8601 UTC. Returns false until
-// the Notecard has synced time with the network.
-static bool notecardTimeIso(char* out, size_t outSize) {
+// Ask the Notecard for UNIX time. Returns false until it has synced with the
+// network. This is I2C traffic on the bus the sensors sit on, so callers go
+// through timeRefresh() rather than calling it per sample.
+static bool notecardFetchUnix(time_t& out) {
   J* req = notecard.newRequest("card.time");
   if (!req) return false;
   J* rsp = notecard.requestAndResponse(req);
@@ -108,8 +171,27 @@ static bool notecardTimeIso(char* out, size_t outSize) {
   double unixTime = JGetNumber(rsp, "time");
   notecard.deleteResponse(rsp);
   if (unixTime <= 0) return false;
+  out = (time_t)unixTime;
+  return true;
+}
 
-  time_t raw = (time_t)unixTime;
+// Re-anchor the clock at most once an hour, and keep trying until the first
+// answer arrives. millis() is good to a few seconds an hour, which is well
+// inside what a 30 s sample interval needs.
+static void timeRefresh() {
+  if (timeValid && (uint32_t)(millis() - timeBaseMs) < TIME_REFRESH_INTERVAL_MS) return;
+  time_t fetched;
+  if (!notecardFetchUnix(fetched)) return;
+  timeBaseUnix = fetched;
+  timeBaseMs = millis();
+  if (!timeValid) Serial.println("[TIME] network time acquired");
+  timeValid = true;
+}
+
+// Current time as ISO 8601 UTC, from the cached anchor plus elapsed millis().
+static bool nowIso(char* out, size_t outSize) {
+  if (!timeValid) return false;
+  time_t raw = timeBaseUnix + (time_t)((uint32_t)(millis() - timeBaseMs) / 1000UL);
   struct tm* utc = gmtime(&raw);
   if (!utc) return false;
   strftime(out, outSize, "%Y-%m-%dT%H:%M:%SZ", utc);
@@ -193,12 +275,16 @@ static bool sendBatch(const Reading* readings, uint8_t count) {
     if (!item) continue;
     JAddStringToObject(item, "deviceId", DEVICE_ID);
 
+    // Only channels that actually read are sent: a missing channel is better
+    // than a zero the dashboard would plot as a real measurement.
     J* arr = JAddArrayToObject(item, "readings");
-    addReading(arr, "temperature", "°C", r.temperatureC, r.timestampIso);
-    addReading(arr, "humidity", "%", r.humidityPct, r.timestampIso);
-    addReading(arr, "pressure", "hPa", r.pressureHpa, r.timestampIso);
-    addReading(arr, "gasResistance", "kΩ", r.gasKOhm, r.timestampIso);
-    addReading(arr, "altitude", "m", r.altitudeM, r.timestampIso);
+    if (r.envValid) {
+      addReading(arr, "temperature", "°C", r.temperatureC, r.timestampIso);
+      addReading(arr, "humidity", "%", r.humidityPct, r.timestampIso);
+      addReading(arr, "pressure", "hPa", r.pressureHpa, r.timestampIso);
+      addReading(arr, "altitude", "m", r.altitudeM, r.timestampIso);
+    }
+    if (r.gasValid) addReading(arr, "gasResistance", "kΩ", r.gasKOhm, r.timestampIso);
     if (r.pmValid) {
       addReading(arr, "pm1", "μg/m³", r.pm1, r.timestampIso);
       addReading(arr, "pm25", "μg/m³", r.pm25, r.timestampIso);
@@ -262,76 +348,314 @@ static bool sendAlert(const Reading& r, const biobot::Result& res, const char* e
 // ---------------------------------------------------------------------------
 // Sensors
 // ---------------------------------------------------------------------------
-static bool bmeBegin() {
-  uint8_t found = 0;
-  if (bme.begin(BME_ADDR_PRIMARY)) {
-    found = BME_ADDR_PRIMARY;
-  } else if (bme.begin(BME_ADDR_SECONDARY)) {
-    found = BME_ADDR_SECONDARY;
+// Raw probe. 0 means the device acknowledged; anything else is the TwoWire
+// error, and which error it is decides the diagnosis:
+//   2 - address not acknowledged: the chip is unpowered, or gone
+//   3 - data not acknowledged
+//   5 - timeout: the bus itself is being held, so no address can answer
+static uint8_t i2cProbe(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission();
+}
+
+static bool i2cPresent(uint8_t addr) { return i2cProbe(addr) == 0; }
+
+// Tear the I2C controller down and bring it back up. A transaction that times
+// out can leave the peripheral wedged so every later transfer fails, which
+// looks exactly like a sensor that vanished.
+static void i2cBusReset() {
+  Wire.end();
+  delay(10);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_CLOCK_HZ);
+  delay(10);
+}
+
+// Probe all three known devices and say what the bus looks like. If the BME is
+// silent while the Notecard still answers, the sensor lost power or died; if
+// nothing answers, the bus is stuck and worth resetting.
+static void i2cDiagnose() {
+  uint8_t bmeErr = i2cProbe(bmeAddr != 0 ? bmeAddr : BME_ADDR_SECONDARY);
+  uint8_t noteErr = i2cProbe(NOTECARD_ADDR);
+  uint8_t pmErr = i2cProbe(BMV080_ADDR);
+  Serial.printf("[I2C] probe errors - bme %u | notecard %u | bmv080 %u\n", bmeErr, noteErr,
+                pmErr);
+  if (bmeErr != 0 && noteErr != 0 && pmErr != 0) {
+    Serial.println("[I2C] nothing on the bus answers - resetting the controller");
+    i2cBusReset();
   }
-  if (!found) {
-    Serial.println("[SETUP] BME680/688 not found - check wiring and address");
+}
+
+// Print every address that answers, so the boot log carries the same evidence
+// an I2C scanner sketch would give. Expect 0x17 (Notecard), 0x57 (BMV080) and
+// one of 0x76/0x77 (BME680/688).
+static void i2cScan() {
+  Serial.print("[SETUP] I2C scan:");
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    if (i2cPresent(addr)) {
+      Serial.printf(" 0x%02X", addr);
+      found++;
+    }
+  }
+  if (found == 0) Serial.print(" nothing answered");
+  Serial.printf("  (%u device%s)\n", found, found == 1 ? "" : "s");
+}
+
+// warmup runs the gas heater settling reads; skipped when re-initialising
+// mid-run so a recovery does not block the loop for ten seconds.
+static bool bmeBegin(bool warmup) {
+  bmeAddr = 0;
+  // 0x76 first: that is where a BME688 sits with SDO low, which is what rev A
+  // of the board leaves it at. Probe before calling begin(), because begin()
+  // against an absent address is a guaranteed failed transaction on a bus we
+  // already suspect.
+  const uint8_t candidates[] = {BME_ADDR_SECONDARY, BME_ADDR_PRIMARY};
+  for (uint8_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]) && bmeAddr == 0; i++) {
+    uint8_t err = i2cProbe(candidates[i]);
+    if (err != 0) {
+      Serial.printf("[BME] 0x%02X no answer (I2C error %u)\n", candidates[i], err);
+    } else if (bme.begin(candidates[i])) {
+      bmeAddr = candidates[i];
+    } else {
+      Serial.printf("[BME] 0x%02X answers but would not identify itself\n", candidates[i]);
+    }
+  }
+  if (bmeAddr == 0) {
+    Serial.println("[BME] unavailable - see the probe errors above");
     return false;
   }
-  Serial.printf("[SETUP] BME680/688 found at 0x%02X\n", found);
+  Serial.printf("[BME] found at 0x%02X\n", bmeAddr);
 
   bme.setTemperatureOversampling(BME680_OS_8X);
   bme.setHumidityOversampling(BME680_OS_2X);
   bme.setPressureOversampling(BME680_OS_4X);
   bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  bme.setGasHeater(320, 150);  // 320 °C for 150 ms
+  if (bmeHeaterOn) {
+    bme.setGasHeater(BME_HEATER_C, BME_HEATER_MS);
+  } else {
+    bme.setGasHeater(0, 0);  // disabled: see the heater fallback below
+  }
+  Serial.printf("[BME] gas heater %s\n", bmeHeaterOn ? "on" : "off (running without gas)");
 
-  Serial.println("[SETUP] Warming up gas heater...");
-  for (uint8_t i = 0; i < SETUP_WARMUP_READS; i++) {
-    if (bme.performReading()) {
-      Serial.printf("[SETUP] Warmup %u/%u - gas %.1f kΩ\n", i + 1, SETUP_WARMUP_READS,
-                    bme.gas_resistance / 1000.0f);
-    } else {
-      Serial.printf("[SETUP] Warmup %u/%u - read failed\n", i + 1, SETUP_WARMUP_READS);
+  if (warmup) {
+    Serial.println("[BME] Settling...");
+    uint8_t ok = 0;
+    for (uint8_t i = 0; i < SETUP_WARMUP_READS; i++) {
+      if (bme.performReading()) {
+        ok++;
+        Serial.printf("[BME] Warmup %u/%u - gas %.1f kΩ\n", i + 1, SETUP_WARMUP_READS,
+                      bme.gas_resistance / 1000.0f);
+      } else {
+        Serial.printf("[BME] Warmup %u/%u - read failed\n", i + 1, SETUP_WARMUP_READS);
+      }
+      delay(2000);
     }
-    delay(2000);
+    // Init succeeded but no reading did: the difference between the two is the
+    // heater, so drop it now rather than spend the first two minutes failing.
+    if (ok == 0 && bmeHeaterOn) {
+      Serial.println("[BME] no warmup read succeeded with the gas heater on - disabling it");
+      bmeHeaterOn = false;
+      bme.setGasHeater(0, 0);
+      lastHeaterRetryMs = millis();
+    }
   }
   return true;
 }
 
+// Throttled recovery, used both when the sensor was missing at boot and when a
+// read fails. Diagnoses the bus first, since a wedged controller has to be
+// reset before re-initialising the sensor can possibly work.
+static void bmeRecover(const char* why) {
+  if ((uint32_t)(millis() - lastBmeRetryMs) < BME_RETRY_INTERVAL_MS) return;
+  lastBmeRetryMs = millis();
+  Serial.printf("[BME] recovering (%s)\n", why);
+  i2cDiagnose();
+  bmeReady = bmeBegin(false);
+  Serial.printf("[BME] recovery %s\n", bmeReady ? "succeeded" : "failed, will retry");
+}
+
+// Try the heater again occasionally: whatever starved it may be temporary, and
+// gas resistance is a real detection signal worth getting back.
+static void bmeHeaterRetry() {
+  if (bmeHeaterOn || !bmeReady) return;
+  if ((uint32_t)(millis() - lastHeaterRetryMs) < BME_HEATER_RETRY_INTERVAL_MS) return;
+  lastHeaterRetryMs = millis();
+  Serial.println("[BME] re-enabling the gas heater to see whether it holds up now");
+  bmeHeaterOn = true;
+  lastBmeRetryMs = millis() - BME_RETRY_INTERVAL_MS;  // let recovery run at once
+  bmeRecover("heater re-enabled");
+}
+
+// Service the particulate sensor's driver and cache whatever it produces. In
+// duty-cycling mode the sensor measures on its own clock and readSensor()
+// returns true exactly once per result, so this runs from the loop all the
+// time and the sample task reads the cache rather than the sensor.
+static void taskPm() {
+  if (!bmv080Ready) return;
+  if ((uint32_t)(millis() - lastPmServiceMs) < PM_SERVICE_INTERVAL_MS) return;
+  lastPmServiceMs = millis();
+  if (!bmv080.readSensor()) return;
+  pmCache.pm1 = bmv080.PM1();
+  pmCache.pm25 = bmv080.PM25();
+  pmCache.pm10 = bmv080.PM10();
+  pmCache.obstructed = bmv080.isObstructed();
+  pmCache.atMs = millis();
+  pmCache.valid = true;
+}
+
+// Read the sensor, retrying once. Firmware/diagnostics/bme_diag reads this
+// sensor 8 times out of 8 with the node's exact settings when nothing else is
+// on the bus, so a read that fails here fails because of what else shares the
+// bus - and the first transfer after the Notecard has been talking is the one
+// that gets lost. A second attempt costs a few hundred milliseconds and tells
+// us plainly which of the two it was.
+static bool bmeReadWithRetry() {
+  if (bme.performReading()) return true;
+  uint8_t err = i2cProbe(bmeAddr);
+  delay(20);
+  if (!bme.performReading()) return false;
+  bmeRetries++;
+  // Say this once with the reasoning, then keep the count on the status line
+  // rather than repeating it every 30 s for the life of the node.
+  if (bmeRetries == 1) {
+    Serial.printf("[SENS] BME read failed then succeeded on retry (probe between: %u) - the "
+                  "first transfer after Notecard traffic gets lost; retries are counted on "
+                  "the status line from here on\n", err);
+  }
+  return true;
+}
+
+// Bring the particulate sensor up, naming the stage that failed. Each stage is
+// a separate fault: an address that does not answer is wiring, a driver that
+// will not open is the Bosch SDK refusing, and a mode that will not set is the
+// sensor refusing to start measuring.
 static bool bmv080Begin() {
   if (!bmv080.begin(BMV080_ADDR, Wire)) {
-    Serial.println("[SETUP] BMV080 not found - check wiring");
+    Serial.println("[PM] begin() failed - nothing usable at 0x57");
     return false;
   }
-  bmv080.init();
-  bmv080.setMode(SF_BMV080_MODE_CONTINUOUS);
-  Serial.println("[SETUP] BMV080 OK");
+  // These two were called with their results thrown away. init() is what opens
+  // the sensor and starts the Bosch driver behind it: if it fails, the sensor
+  // sits on the bus acknowledging probes and never produces a single sample,
+  // which is exactly what "no sample in 2500 ms, I2C error 0" looks like.
+  if (!bmv080.init()) {
+    Serial.println("[PM] init() failed - the sensor answers on I2C but its driver "
+                   "would not open, so it will never measure");
+    return false;
+  }
+  // Period before mode: the Bosch driver takes its parameters before a
+  // measurement starts, not during one.
+  if (!bmv080.setDutyCyclingPeriod(BMV080_DUTY_PERIOD_S)) {
+    Serial.println("[PM] setDutyCyclingPeriod() failed");
+    return false;
+  }
+  if (!bmv080.setMode(SF_BMV080_MODE_DUTY_CYCLE)) {
+    Serial.println("[PM] setMode(duty cycle) failed - driver open but not measuring");
+    return false;
+  }
+  pmCache.valid = false;  // nothing from before a (re)start is trusted
+  Serial.printf("[PM] ready - duty cycling, one sample every %u s\n", BMV080_DUTY_PERIOD_S);
   return true;
 }
 
-// Fill r from the sensors. Returns false if the BME680 could not be read.
+// The BME680/688 turned out to lose its first transfer after other traffic on
+// this bus; assume the particulate sensor can too, and do not give up on one
+// refusal.
+static bool bmv080BeginRetrying(uint8_t attempts) {
+  for (uint8_t i = 1; i <= attempts; i++) {
+    if (bmv080Begin()) return true;
+    if (i < attempts) {
+      Serial.printf("[PM] attempt %u of %u failed - retrying\n", i, attempts);
+      delay(500);
+    }
+  }
+  return false;
+}
+
+static void bmv080Recover() {
+  if (bmv080Ready) return;
+  if ((uint32_t)(millis() - lastBmv080RetryMs) < BMV080_RETRY_INTERVAL_MS) return;
+  lastBmv080RetryMs = millis();
+  Serial.println("[PM] retrying the particulate sensor");
+  bmv080Ready = bmv080Begin();
+  if (bmv080Ready) pmFaultLogged = false;  // complain again if it drops out later
+}
+
+// Fill r from the sensors. The two sensors are read independently, so losing
+// one does not cost the other: PM2.5 is the primary wildfire signal and must
+// keep flowing even with a dead BME. Returns false only when neither sensor
+// produced anything, so there is nothing worth recording.
 static bool readSensors(Reading& r) {
   memset(&r, 0, sizeof(r));
 
-  if (!bmeReady || !bme.performReading()) {
-    Serial.println("[SENS] BME680/688 read failed");
-    return false;
-  }
-  r.temperatureC = bme.temperature;
-  r.humidityPct = bme.humidity;
-  r.pressureHpa = bme.pressure / 100.0f;
-  r.gasKOhm = bme.gas_resistance / 1000.0f;
-  r.altitudeM = pressureToAltitudeM(r.pressureHpa);
-  if (r.gasKOhm < 1.0f || r.gasKOhm > 500.0f) {
-    Serial.printf("[SENS] WARNING: gas resistance %.1f kΩ out of expected range\n", r.gasKOhm);
+  // Another library sharing this bus (the Notecard) can leave the clock where
+  // it wants it; put it back before touching the sensors.
+  Wire.setClock(I2C_CLOCK_HZ);
+
+  // Spend a throwaway transfer first. The transfer that follows Notecard
+  // traffic is the one that gets lost, so let it be this one rather than a
+  // measurement: it is why the retry below almost always succeeds.
+  if (bmeReady) i2cProbe(bmeAddr);
+
+  if (!bmeReady) {
+    bmeRecover("never initialised");
+  } else if (bmeReadWithRetry()) {
+    bmeFailures = 0;
+    r.envValid = true;
+    r.temperatureC = bme.temperature;
+    r.humidityPct = bme.humidity;
+    r.pressureHpa = bme.pressure / 100.0f;
+    r.altitudeM = pressureToAltitudeM(r.pressureHpa);
+    // The library zeroes gas_resistance when the heater did not reach a stable
+    // temperature, so a zero here means "no gas reading", not "no resistance".
+    r.gasKOhm = bme.gas_resistance / 1000.0f;
+    r.gasValid = bmeHeaterOn && r.gasKOhm > 0.0f;
+    if (r.gasValid && (r.gasKOhm < 1.0f || r.gasKOhm > 500.0f)) {
+      Serial.printf("[SENS] WARNING: gas resistance %.1f kΩ out of expected range\n", r.gasKOhm);
+    }
+  } else {
+    if (bmeFailures < 255) bmeFailures++;
+    uint8_t err = i2cProbe(bmeAddr);
+    Serial.printf("[SENS] BME680/688 read failed (%u in a row) - 0x%02X %s (I2C error %u)\n",
+                  bmeFailures, bmeAddr, err == 0 ? "still answers" : "silent", err);
+    // Init keeps succeeding while readings keep failing, and the difference
+    // between the two is the heater. Give the heater up rather than the sensor.
+    if (bmeHeaterOn && bmeFailures >= BME_HEATER_OFF_AFTER_FAILURES) {
+      Serial.println("[BME] reads keep failing with the gas heater on - disabling the heater");
+      Serial.println("[BME] if readings now succeed, the heater current is browning the sensor "
+                     "out: shorten its lead, decouple its 3V3, or give it its own supply");
+      bmeHeaterOn = false;
+      lastHeaterRetryMs = millis();
+      lastBmeRetryMs = millis() - BME_RETRY_INTERVAL_MS;  // re-init straight away
+    }
+    bmeRecover("read failed");
   }
 
-  r.pmValid = bmv080.readSensor();
+  uint32_t pmAgeMs = pmCache.valid ? (uint32_t)(millis() - pmCache.atMs) : 0;
+  r.pmValid = bmv080Ready && pmCache.valid && pmAgeMs < PM_STALE_MS;
   if (r.pmValid) {
-    r.pm1 = bmv080.PM1();
-    r.pm25 = bmv080.PM25();
-    r.pm10 = bmv080.PM10();
-    r.pmObstructed = bmv080.isObstructed();
+    r.pm1 = pmCache.pm1;
+    r.pm25 = pmCache.pm25;
+    r.pm10 = pmCache.pm10;
+    r.pmObstructed = pmCache.obstructed;
   } else {
-    Serial.println("[SENS] BMV080 read failed");
+    if (!bmv080Ready) {
+      // Once is enough: the minute retry already reports the stage it fails at,
+      // so repeating this every sample only buries the readings that do work.
+      if (!pmFaultLogged) {
+        Serial.println("[SENS] BMV080 unavailable - its driver is not open; see the [PM] lines");
+        pmFaultLogged = true;
+      }
+    } else if (!pmCache.valid) {
+      Serial.println("[SENS] BMV080 has not produced its first sample yet");
+    } else {
+      Serial.printf("[SENS] BMV080 last sample is %lu s old (limit %lu s) - 0x%02X I2C error %u\n",
+                    (unsigned long)(pmAgeMs / 1000), (unsigned long)(PM_STALE_MS / 1000),
+                    BMV080_ADDR, i2cProbe(BMV080_ADDR));
+    }
   }
-  return true;
+  return r.envValid || r.pmValid;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +676,8 @@ static void taskSample() {
 
   Reading r;
   if (!readSensors(r)) return;
-  bool hasTime = notecardTimeIso(r.timestampIso, sizeof(r.timestampIso));
+  timeRefresh();
+  bool hasTime = nowIso(r.timestampIso, sizeof(r.timestampIso));
 
   // Detection runs on every sample, even before the clock or buffer are ready.
   biobot::Sample s;
@@ -362,14 +687,24 @@ static void taskSample() {
   s.pm25 = r.pm25;
   s.pmValid = r.pmValid;
   s.pmObstructed = r.pmObstructed;
+  s.envValid = r.envValid;
+  s.gasValid = r.gasValid;
   biobot::Result res = detector.update(s, millis());
   r.severity = res.severity;
   r.anomalyScore = res.score;
   sampleCount++;
 
-  Serial.printf("[SENS] T:%.1f°C H:%.1f%% P:%.1fhPa Gas:%.1fkΩ PM2.5:%.1f %s | %s score:%u%s\n",
-                r.temperatureC, r.humidityPct, r.pressureHpa, r.gasKOhm, r.pm25,
-                hasTime ? r.timestampIso : "(no time yet)",
+  Serial.print("[SENS] ");
+  if (r.envValid) {
+    Serial.printf("T:%.1f°C H:%.1f%% P:%.1fhPa ", r.temperatureC, r.humidityPct, r.pressureHpa);
+    if (r.gasValid) Serial.printf("Gas:%.1fkΩ ", r.gasKOhm);
+    else Serial.print("Gas:n/a ");
+  } else {
+    Serial.print("BME:fault ");
+  }
+  if (r.pmValid) Serial.printf("PM2.5:%.1f ", r.pm25);
+  else Serial.print("PM2.5:n/a ");
+  Serial.printf("%s | %s score:%u%s\n", hasTime ? r.timestampIso : "(no time yet)",
                 biobot::Detector::severityName(res.severity), res.score,
                 res.baselineReady ? "" : " [baseline learning]");
 
@@ -422,11 +757,14 @@ static void taskStatus() {
   lastStatusMs = millis();
   uint32_t sinceSend = millis() - lastDataSendMs;
   uint32_t untilSend = sinceSend >= DATA_SEND_INTERVAL_MS ? 0 : DATA_SEND_INTERVAL_MS - sinceSend;
-  Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | buffer %u/%u | dropped %lu | "
-                "severity %s | next send in %lu s\n\n",
+  Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | bme %s | pm %s | buffer %u/%u | "
+                "dropped %lu | retries %lu | severity %s | next send in %lu s\n\n",
                 (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
-                deviceRegistered ? "yes" : "no", bufferCount, BUFFER_CAPACITY,
-                (unsigned long)droppedReadings,
+                deviceRegistered ? "yes" : "no",
+                bmeReady ? (bmeHeaterOn ? "ok" : "ok, no gas") : "FAULT",
+                bmv080Ready ? (pmCache.valid ? "ok" : "ok, waiting") : "FAULT",
+                bufferCount, BUFFER_CAPACITY,
+                (unsigned long)droppedReadings, (unsigned long)bmeRetries,
                 biobot::Detector::severityName(detector.severity()),
                 (unsigned long)(untilSend / 1000));
 }
@@ -452,17 +790,20 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_CLOCK_HZ);
   delay(100);
+  i2cScan();
 
   Serial.println("[SETUP] Init BME680/688...");
-  bmeReady = bmeBegin();
+  bmeReady = bmeBegin(true);
 
   Serial.println("[SETUP] Init BMV080...");
-  if (!bmv080Begin()) {
-    // Without the particulate sensor the node cannot do its main job.
-    while (true) {
-      Serial.println("[SETUP] HALTED - no BMV080");
-      delay(5000);
-    }
+  bmv080Ready = bmv080BeginRetrying(BMV080_BOOT_ATTEMPTS);
+  lastBmv080RetryMs = millis();
+  if (!bmv080Ready) {
+    // Halting used to seem right - PM2.5 is the node's main job - but a halted
+    // node reports nothing at all, not even that it is broken. Carry on: the
+    // detector raises a sensor fault after ten failed particulate reads, which
+    // reaches the operator, and temperature and humidity still get logged.
+    Serial.println("[SETUP] WARNING: no particulate sensor - continuing without PM2.5");
   }
 
   notecardBegin();
@@ -474,6 +815,9 @@ void setup() {
 
 void loop() {
   taskRegister();
+  bmeHeaterRetry();
+  bmv080Recover();
+  taskPm();
   taskSample();
   taskSend();
   taskStatus();

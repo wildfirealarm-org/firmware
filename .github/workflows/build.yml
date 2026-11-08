@@ -50,7 +50,12 @@ jobs:
              bmv080-sdk/api/api/lib/xtensa_esp32s3/xtensa_esp32s3_elf_gcc/release/lib_postProcessor.a "$LIB/esp32s3/"
       - name: Provide a config.h for the build
         if: env.HAVE_SDK == 'true'
-        run: cp Firmware/Notecard/config.example.h Firmware/Notecard/config.h
+        run: |
+          cp Firmware/Notecard/config.example.h Firmware/Notecard/config.h
+          cp Firmware/Notecard_LowPower/config.example.h Firmware/Notecard_LowPower/config.h
       - name: Compile
         if: env.HAVE_SDK == 'true'
         run: arduino-cli compile --fqbn arduino:esp32:nano_nora --warnings default Firmware/Notecard
+      - name: Compile the low-power firmware
+        if: env.HAVE_SDK == 'true'
+        run: arduino-cli compile --fqbn arduino:esp32:nano_nora --warnings default Firmware/Notecard_LowPower

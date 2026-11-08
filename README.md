@@ -4,6 +4,17 @@ Firmware for the Wildfire Alarm sensor node: an open, low-cost module
 that towns and volunteers place at the forest edge to catch early signs of
 smoke and fire. See the mission document for the bigger picture.
 
+## Which firmware to use
+
+| Folder | Use it for | Samples | Sends a batch |
+| --- | --- | --- | --- |
+| `Firmware/Notecard_LowPower` | **Any node on battery or solar.** Light-sleeps between samples, and can read battery state from a Victron charge controller over Bluetooth | every 60 s | every 20 min |
+| `Firmware/Notecard` | Bench or mains power, where current draw does not matter | every 30 s | every 10 min |
+
+Both run the same sensors, anomaly detector and notes, described below with
+the `Firmware/Notecard` timings. The low-power variant's own differences are in
+[`Firmware/Notecard_LowPower/README.md`](Firmware/Notecard_LowPower/README.md).
+
 ## What the node does
 
 Every 30 seconds the node reads:
@@ -85,11 +96,16 @@ periodic reminder), or `cleared`.
    its SparkFun Toolkit dependency), and **Blues Wireless Notecard**.
 3. Install the Bosch BMV080 SDK into the SparkFun library. See the next
    section; the build fails with `bmv080.h not found` until this is done.
-4. Copy `Firmware/Notecard/config.example.h` to `Firmware/Notecard/config.h`
-   and fill in your Notehub product UID and device identity. `config.h` is
-   git-ignored.
-5. Open `Firmware/Notecard/Notecard.ino` and upload. Serial Monitor at
-   115200 baud shows every step of startup.
+4. Pick the firmware folder (see "Which firmware to use"). Copy its
+   `config.example.h` to `config.h` in the same folder and fill in your
+   Notehub product UID and device identity. `config.h` is git-ignored.
+5. Open the folder's `.ino` (`Notecard_LowPower.ino` or `Notecard.ino`) and
+   upload. Serial Monitor at 115200 baud shows every step of startup.
+
+The firmware sends `hub.set` with the product UID and mode at every boot, so
+a new or swapped Notecard needs no separate setup. To check a Notecard on its
+own first, `Firmware/diagnostics/notecard_console` passes requests typed in
+the Serial Monitor straight to it.
 
 Wiring defaults are at the top of the sketch: I2C on A4/A5 at 100 kHz.
 
@@ -129,6 +145,113 @@ the USB cable. Check polarity before applying power; rev A of the board
 has no fuse. Attach the cellular antenna to the Notecard's main u.FL
 connector before the first boot.
 
+## Reading the boot log
+
+The sketch scans the I2C bus before it touches a sensor, so the first
+useful line of every boot lists what answered:
+
+```
+[SETUP] I2C scan: 0x17 0x57 0x76  (3 devices)
+```
+
+Expect `0x17` (Notecard), `0x57` (BMV080) and one of `0x76` / `0x77`
+(BME680/688 — rev A leaves SDO low, so 0x76). When a read fails, the log
+carries the raw TwoWire error code:
+
+| Error | Meaning |
+| --- | --- |
+| 0 | the chip acknowledged: the bus is fine and the measurement itself failed |
+| 2 | address not acknowledged: that chip is unpowered, in reset, or gone |
+| 5 | timeout: the bus is being held, so no address can answer |
+
+A failed read triggers a recovery pass, which probes all three devices
+first. If every probe is non-zero the bus is wedged and the controller is
+torn down and restarted. If only the BME is non-zero while the Notecard
+answers, the bus is healthy and the sensor itself dropped out.
+
+### When init succeeds but every reading fails
+
+This is the interesting case, and it points at one thing. `begin()` only
+soft-resets the chip and reads its calibration, which costs almost no
+current. A reading additionally fires the gas heater — 320 °C for 150 ms —
+and that is the only part of the cycle that draws real current. So a
+sensor that initialises perfectly and then fails every single reading,
+NACKing for a moment afterwards and answering again straight after, is a
+sensor whose supply cannot hold up under the heater. Its own brown-out
+detector puts it briefly into reset; that is the NACK.
+
+The node handles this itself. If no warmup read succeeds at boot, or three
+readings in a row fail, it disables the heater and says so:
+
+```
+[BME] reads keep failing with the gas heater on - disabling the heater
+[BME] if readings now succeed, the heater current is browning the sensor out:
+      shorten its lead, decouple its 3V3, or give it its own supply
+```
+
+Readings then resume without gas resistance, and the status line reads
+`bme ok, no gas`. The heater is re-tried once an hour in case the cause was
+temporary. If readings work with the heater off, the diagnosis is confirmed
+and the fix is electrical, not firmware: a shorter lead to the sensor, a
+10 µF bulk plus 100 nF ceramic across its 3V3 and GND at the sensor end,
+or a supply that is not shared with the Notecard's modem.
+
+### The BMV080 runs duty-cycled
+
+The sensor measures once every 20 s on its own clock and sleeps between,
+instead of producing a sample every second in continuous mode. The loop
+services its driver every 250 ms and caches each result as it arrives; a
+sample reads the cache. A cached result older than three periods (60 s) is
+treated as a fault:
+
+```
+[SENS] BMV080 last sample is 74 s old (limit 60 s) - 0x57 I2C error 0
+```
+
+Continuous mode was 182 mW, a third of the node's power budget, for 29
+samples in every 30 that were never used.
+
+### Degraded operation
+
+The two sensors are read independently, so one failing does not silence
+the other. PM2.5 is the primary wildfire signal and keeps flowing with a
+dead BME; temperature, humidity and pressure keep flowing with the heater
+off. Channels that did not read are **omitted** from the note rather than
+sent as zero, and the detector treats an absent channel as absent — it
+raises no signal and does not move its baseline. A humidity reading of
+zero from a failed sensor would otherwise look like a 55-point humidity
+drop and trip a false alert; there is a host test covering exactly that.
+
+Network time is fetched from the Notecard once and carried forward on
+`millis()`, re-anchored hourly, rather than fetched for every sample. That
+keeps 20 of every 21 Notecard transactions off the bus the sensors share.
+
+## Power
+
+Measured on the first node with a 3000 mAh (33 Wh) pack and the panel in
+poor light, the original firmware flattened the battery in three days. The
+budget behind that, from datasheets and the firmware's duty cycle:
+
+| Load | At 12 V | Share |
+| --- | --- | --- |
+| BMV080, continuous | 333 mW | 34 % |
+| Nano ESP32, never sleeps | 274 mW | 28 % |
+| Notecard, `continuous` mode | 262 mW | 26 % |
+| Charge controller self-consumption | 120 mW | 12 % |
+| BME688 | 0.5 mW | — |
+| **Total** | **~990 mW, ~24 Wh/day** | |
+
+Two of the three large loads are settings:
+
+- **BMV080 duty cycling** (this firmware) removes most of the first row.
+- **`NOTEHUB_MODE "periodic"`** in `config.h` removes most of the third. Every
+  note the node sends is added with `sync:true`, so batches and alerts still
+  go out immediately; the modem just drops the tower connection in between.
+
+Together they take the node to roughly 11 Wh/day. Putting the ESP32 to
+sleep between samples is the remaining lever; `Firmware/Notecard_LowPower`
+does that, and also samples and sends half as often.
+
 ## Testing the detector on your computer
 
 The anomaly logic has no Arduino dependencies, so it can be tested on a
@@ -142,21 +265,24 @@ g++ -std=c++17 -Wall -Wextra -I. anomaly.cpp test/test_anomaly.cpp -o test/test_
 
 The tests cover clean air, debounced smoke alerts, multi-signal escalation,
 hysteresis, the all-clear, periodic reminders, baseline-relative temperature
-rise, and sensor faults.
+rise, sensor faults, and degraded operation with a failed BME or a disabled
+gas heater.
 
 ## Repository layout
 
 ```
-Firmware/Notecard/Notecard.ino      main sketch: sensors, buffering, Notecard I/O
-Firmware/Notecard/anomaly.h / .cpp  portable anomaly detector
-Firmware/Notecard/config.example.h  template for per-node secrets and identity
+Firmware/Notecard_LowPower/         low-power sketch for battery and solar nodes, plus Victron BLE readout
+Firmware/Notecard/Notecard.ino      sketch without sleep, for bench and mains
+Firmware/Notecard/anomaly.h / .cpp  portable anomaly detector (copied into Notecard_LowPower)
+Firmware/Notecard/config.example.h  template for per-node identity
 Firmware/Notecard/test/             host-side unit tests
+Firmware/diagnostics/               bench sketches: Notecard console, I2C watch, BME check
 archive/new.grc/                    earlier UART-based prototype, kept for reference
 ```
 
 ## Power note
 
-The default Notehub mode is `continuous`, which keeps the modem online and is
-the hungriest setting. For a solar node, set `NOTEHUB_MODE` to `"periodic"`
-in `config.h`. Alert notes are added with `sync:true`, so they still go out
-immediately in periodic mode; only routine batches wait for the next sync.
+Both `config.example.h` files default to `NOTEHUB_MODE "periodic"`, which
+lets the modem sleep between syncs. Every note is added with `sync:true`, so
+batches and alerts still go out immediately. Use `"continuous"` only on
+mains power.
